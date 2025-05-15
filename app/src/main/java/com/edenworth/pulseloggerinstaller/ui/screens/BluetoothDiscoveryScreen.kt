@@ -4,6 +4,10 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -16,11 +20,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -29,20 +29,31 @@ import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import android.content.pm.PackageManager
+import android.os.ParcelUuid
+import android.util.Log
+
+data class BLEDevice(
+    val device: BluetoothDevice,
+    val rssi: Int,
+    val scanRecord: ByteArray? = null
+)
 
 @SuppressLint("MissingPermission")
 @Composable
 fun BluetoothDiscoveryScreen(onDeviceSelected: () -> Unit) {
     val context = LocalContext.current
-    val bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
+    val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+    val bluetoothAdapter = bluetoothManager.adapter
+    val bluetoothLeScanner = bluetoothAdapter?.bluetoothLeScanner
+    
     var isScanning by remember { mutableStateOf(false) }
-    var devices by remember { mutableStateOf(listOf<BluetoothDevice>()) }
+    var devices by remember { mutableStateOf(listOf<BLEDevice>()) }
     var permissionGranted by remember { mutableStateOf(false) }
     var permissionRequested by remember { mutableStateOf(false) }
     var permanentlyDenied by remember { mutableStateOf(false) }
     var filter by remember { mutableStateOf("") }
     var showFilterDialog by remember { mutableStateOf(false) }
-    var selectedDevice by remember { mutableStateOf<BluetoothDevice?>(null) }
+    var selectedDevice by remember { mutableStateOf<BLEDevice?>(null) }
     var showDeviceDetailsDialog by remember { mutableStateOf(false) }
 
     // Permissions for Android 12+
@@ -67,39 +78,38 @@ fun BluetoothDiscoveryScreen(onDeviceSelected: () -> Unit) {
         onResult = { results ->
             permissionGranted = results.values.all { it }
             permissionRequested = true
-            // If any permission is denied and shouldShowRequestPermissionRationale is false, it's permanently denied
             permanentlyDenied = results.any { !it.value && !shouldShowRationale(context, it.key) }
         }
     )
 
-    DisposableEffect(context) {
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(ctx: Context?, intent: Intent?) {
-                if (intent?.action == BluetoothDevice.ACTION_FOUND) {
-                    val device: BluetoothDevice? = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
-                    device?.let {
-                        if (devices.none { it.address == device.address }) {
-                            devices = devices + device
-                        }
-                    }
-                }
+    val scanCallback = remember {
+        object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                val device = BLEDevice(
+                    device = result.device,
+                    rssi = result.rssi,
+                    scanRecord = result.scanRecord?.bytes
+                )
+                devices = devices.filter { it.device.address != device.device.address } + device
             }
-        }
-        val filter = IntentFilter(BluetoothDevice.ACTION_FOUND)
-        context.registerReceiver(receiver, filter)
-        onDispose {
-            context.unregisterReceiver(receiver)
+
+            override fun onScanFailed(errorCode: Int) {
+                Log.e("BLEScan", "Scan failed with error: $errorCode")
+                isScanning = false
+            }
         }
     }
 
     fun startDiscovery() {
-        devices = emptyList()
-        bluetoothAdapter?.startDiscovery()
-        isScanning = true
+        if (bluetoothLeScanner != null) {
+            devices = emptyList()
+            bluetoothLeScanner.startScan(scanCallback)
+            isScanning = true
+        }
     }
 
     fun stopDiscovery() {
-        bluetoothAdapter?.cancelDiscovery()
+        bluetoothLeScanner?.stopScan(scanCallback)
         isScanning = false
     }
 
@@ -107,10 +117,12 @@ fun BluetoothDiscoveryScreen(onDeviceSelected: () -> Unit) {
         modifier = Modifier.fillMaxSize().padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Text("Bluetooth Device Discovery", modifier = Modifier.padding(bottom = 16.dp))
+        Text("BLE Device Discovery", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(bottom = 16.dp))
+        
         Button(onClick = { showFilterDialog = true }, modifier = Modifier.padding(bottom = 16.dp)) {
             Text("Filter: ${if (filter.isBlank()) "(none)" else filter}")
         }
+        
         if (showFilterDialog) {
             AlertDialog(
                 onDismissRequest = { showFilterDialog = false },
@@ -137,6 +149,7 @@ fun BluetoothDiscoveryScreen(onDeviceSelected: () -> Unit) {
                 }
             )
         }
+
         if (!permissionGranted) {
             if (permanentlyDenied) {
                 Text("Bluetooth and Location permissions are permanently denied. Please enable them in app settings.", modifier = Modifier.padding(bottom = 16.dp))
@@ -157,20 +170,22 @@ fun BluetoothDiscoveryScreen(onDeviceSelected: () -> Unit) {
         } else {
             Row(modifier = Modifier.padding(bottom = 16.dp)) {
                 Button(onClick = { startDiscovery() }, enabled = !isScanning) {
-                    Text("Start Scan")
+                    Text("Start BLE Scan")
                 }
                 Spacer(modifier = Modifier.width(8.dp))
                 Button(onClick = { stopDiscovery() }, enabled = isScanning) {
                     Text("Stop Scan")
                 }
             }
+
             if (devices.isEmpty()) {
-                Text("No devices found yet.")
+                Text("No BLE devices found yet.")
             } else {
                 val filteredDevices = devices.filter { device ->
-                    val name = device.name ?: "Unknown"
+                    val name = device.device.name ?: "Unknown"
                     filter.isBlank() || name.contains(filter, ignoreCase = true)
                 }
+                
                 if (filteredDevices.isEmpty()) {
                     Text("No devices match the filter.")
                 } else {
@@ -183,7 +198,11 @@ fun BluetoothDiscoveryScreen(onDeviceSelected: () -> Unit) {
                                 },
                                 modifier = Modifier.fillMaxWidth().padding(8.dp)
                             ) {
-                                Text("${device.name ?: "Unknown"} - ${device.address}")
+                                Column {
+                                    Text("${device.device.name ?: "Unknown"}")
+                                    Text("Signal: ${device.rssi} dBm", style = MaterialTheme.typography.bodySmall)
+                                    Text("Address: ${device.device.address}", style = MaterialTheme.typography.bodySmall)
+                                }
                             }
                         }
                     }
@@ -193,7 +212,7 @@ fun BluetoothDiscoveryScreen(onDeviceSelected: () -> Unit) {
     }
 
     if (showDeviceDetailsDialog && selectedDevice != null) {
-        DeviceDetailsDialog(
+        BLEDeviceDetailsDialog(
             device = selectedDevice!!,
             onDismiss = { showDeviceDetailsDialog = false },
             onNext = {
@@ -204,14 +223,8 @@ fun BluetoothDiscoveryScreen(onDeviceSelected: () -> Unit) {
     }
 }
 
-private fun shouldShowRationale(context: Context, permission: String): Boolean {
-    // This is a stub for demo purposes. In a real app, you would use ActivityCompat.shouldShowRequestPermissionRationale
-    // but in Compose, you may need to pass an Activity reference or use Accompanist permissions.
-    return true // Always return true for now (so we don't mark as permanently denied by accident)
-}
-
 @Composable
-fun DeviceDetailsDialog(device: BluetoothDevice, onDismiss: () -> Unit, onNext: () -> Unit) {
+fun BLEDeviceDetailsDialog(device: BLEDevice, onDismiss: () -> Unit, onNext: () -> Unit) {
     val context = LocalContext.current
     val hasPermission = remember {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -226,21 +239,25 @@ fun DeviceDetailsDialog(device: BluetoothDevice, onDismiss: () -> Unit, onNext: 
             ) == PackageManager.PERMISSION_GRANTED
         }
     }
+
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Device Details") },
+        title = { Text("BLE Device Details") },
         text = {
             Column {
-                Text("Name: " + if (hasPermission) (device.name ?: "Unknown") else "Unknown")
-                Text("Address: ${device.address}")
-                Text("Bond State: ${device.bondState}")
-                Text("Type: ${device.type}")
-                // Add more attributes as needed
+                Text("Name: " + if (hasPermission) (device.device.name ?: "Unknown") else "Unknown")
+                Text("Address: ${device.device.address}")
+                Text("Signal Strength: ${device.rssi} dBm")
+                Text("Bond State: ${device.device.bondState}")
+                Text("Type: ${device.device.type}")
+                if (device.scanRecord != null) {
+                    Text("Advertisement Data: ${device.scanRecord.joinToString(", ") { String.format("%02X", it) }}")
+                }
             }
         },
         confirmButton = {
             TextButton(onClick = onNext) {
-                Text("Next")
+                Text("Connect")
             }
         },
         dismissButton = {
@@ -249,4 +266,8 @@ fun DeviceDetailsDialog(device: BluetoothDevice, onDismiss: () -> Unit, onNext: 
             }
         }
     )
+}
+
+private fun shouldShowRationale(context: Context, permission: String): Boolean {
+    return true
 } 
